@@ -73,6 +73,11 @@ CATEGORY_TO_CPV = {
     "vehicles": ["34*"],
     "software": ["48*"],
     "construction": ["45*"],
+
+    # NEW: building-related exclusions (important for your case)
+    "buildings": ["4521*", "453*", "454*"],
+    "building": ["4521*", "453*", "454*"],
+    "building construction": ["4521*", "453*", "454*"],
 }
 
 STATUS_SYNONYMS = {
@@ -150,6 +155,7 @@ class ParsedDefinition:
     typeOfDocument: List[str] = field(default_factory=list)
     nutsCodes: List[str] = field(default_factory=list)
     cpvCodes: List[str] = field(default_factory=list)
+    excludeCpvCodes: List[str] = field(default_factory=list)
     procedure: List[str] = field(default_factory=list)
     authorityTypes: List[str] = field(default_factory=list)
     frameworkAgreementAnyOrMissing: bool = False
@@ -285,6 +291,16 @@ def extract_exclusions(text: str) -> List[str]:
     return results
 
 
+def extract_exclude_cpv_codes(exclude_keywords: List[str]) -> List[str]:
+    found: List[str] = []
+    for phrase in exclude_keywords:
+        phrase_norm = phrase.strip().lower()
+        for label, codes in CATEGORY_TO_CPV.items():
+            if phrase_norm == label or phrase_norm in label or label in phrase_norm:
+                found.extend(codes)
+    return list(dict.fromkeys(found))
+
+
 def extract_keywords(text: str, parsed: ParsedDefinition) -> List[str]:
     scrubbed = text
 
@@ -325,6 +341,7 @@ def parse_human_definition(user_text: str) -> ParsedDefinition:
         phrase in text for phrase in ["framework agreement", "framework agreements"]
     )
     parsed.excludeKeywords = extract_exclusions(text)
+    parsed.excludeCpvCodes = extract_exclude_cpv_codes(parsed.excludeKeywords)
     parsed.keywords = extract_keywords(text, parsed)
 
     if not parsed.typeOfDocument and ("tender" in text or "tenders" in text):
@@ -387,16 +404,38 @@ def build_main_text_block(keywords: List[str]) -> str:
     return f'(title:({joined}) OR description:({joined}) OR fulltext:({joined}))'
 
 
-def build_exclusion_block(exclude_keywords: List[str]) -> str:
-    if not exclude_keywords:
+def build_exclusion_block(exclude_keywords: List[str], exclude_cpv_codes: List[str]) -> str:
+    blocks: List[str] = []
+
+    # 1. CPV exclusions (preferred)
+    if exclude_cpv_codes:
+        cpv_joined = " OR ".join(exclude_cpv_codes)
+        blocks.append(f'cpvCodes:({cpv_joined})')
+
+    # 2. Remaining text exclusions
+    remaining_keywords = []
+    for k in exclude_keywords:
+        phrase_norm = k.strip().lower()
+        matched = any(
+            phrase_norm == label or phrase_norm in label or label in phrase_norm
+            for label in CATEGORY_TO_CPV
+        )
+        if not matched:
+            remaining_keywords.append(k)
+
+    if remaining_keywords:
+        terms = [quote_if_needed(k) for k in remaining_keywords if k.strip()]
+        if terms:
+            joined = " OR ".join(terms)
+            blocks.append(f'(title:({joined}) OR description:({joined}) OR fulltext:({joined}))')
+
+    if not blocks:
         return ""
 
-    terms = [quote_if_needed(k) for k in exclude_keywords if k.strip()]
-    if not terms:
-        return ""
+    if len(blocks) == 1:
+        return blocks[0]
 
-    joined = " OR ".join(terms)
-    return f'(title:({joined}) OR description:({joined}) OR fulltext:({joined}))'
+    return " OR ".join(f'({b})' for b in blocks)
 
 
 def build_multi_choice(field_name: str, values: List[str]) -> str:
@@ -478,7 +517,7 @@ def build_ts_query(parsed: ParsedDefinition) -> str:
     if price_block:
         positive_blocks.append(price_block)
 
-    negative_block = build_exclusion_block(parsed.excludeKeywords)
+    negative_block = build_exclusion_block(parsed.excludeKeywords, parsed.excludeCpvCodes)
 
     query = " AND ".join(f"({block})" for block in positive_blocks if block)
 
