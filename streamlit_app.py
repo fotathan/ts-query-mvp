@@ -43,22 +43,38 @@ FIELD_CONFIG = {
 
 COUNTRY_TO_NUTS = {
     "greece": ["el*", "gr*"],
+    "greek": ["el*", "gr*"],
     "cyprus": ["cy*"],
+    "cypriot": ["cy*"],
     "germany": ["de*"],
+    "german": ["de*"],
     "austria": ["at*"],
+    "austrian": ["at*"],
     "switzerland": ["ch*"],
+    "swiss": ["ch*"],
     "romania": ["ro*"],
+    "romanian": ["ro*"],
     "spain": ["es*"],
+    "spanish": ["es*"],
     "croatia": ["hr*"],
+    "croatian": ["hr*"],
     "slovenia": ["si*"],
+    "slovenian": ["si*"],
     "hungary": ["hu*"],
+    "hungarian": ["hu*"],
     "poland": ["pl*"],
+    "polish": ["pl*"],
     "czech republic": ["cz*"],
     "czechia": ["cz*"],
+    "czech": ["cz*"],
     "slovakia": ["sk*"],
+    "slovak": ["sk*"],
     "serbia": ["rs*"],
+    "serbian": ["rs*"],
     "bosnia": ["ba*"],
+    "bosnian": ["ba*"],
     "bulgaria": ["bg*"],
+    "bulgarian": ["bg*"],
 }
 
 CATEGORY_TO_CPV = {
@@ -66,10 +82,22 @@ CATEGORY_TO_CPV = {
     "medicine": ["336*"],
     "pharmaceuticals": ["336*"],
     "pharmaceutical": ["336*"],
+
     "cars": ["341*"],
+    "car": ["341*"],
     "vehicles": ["34*"],
+    "vehicle": ["34*"],
+
     "software": ["48*"],
     "construction": ["45*"],
+
+    "food": ["15*"],
+    "foods": ["15*"],
+    "food products": ["15*"],
+
+    "office equipment": ["301*"],
+    "office supplies": ["301*"],
+    "office machinery": ["301*"],
 
     # building-related exclusions / narrower construction categories
     "buildings": ["4521*", "453*", "454*"],
@@ -89,6 +117,7 @@ TYPE_SYNONYMS = {
     "procurement_plan": ["procurement plan", "procurement plans"],
     "other_information": ["other information"],
     "result": ["result", "results"],
+    "contract": ["contract", "contracts", "awarded contract", "awarded contracts"],
 }
 
 PROCEDURE_MAP = {
@@ -193,6 +222,7 @@ class ParsedDefinition:
 # -----------------------------
 def normalize_text(text: str) -> str:
     text = text.strip().lower()
+    text = text.replace("-", " ")
     text = re.sub(r"\s+", " ", text)
     return text
 
@@ -244,8 +274,8 @@ def extract_price(text: str) -> Optional[PriceFilter]:
 
 def extract_country_nuts(text: str) -> List[str]:
     found: List[str] = []
-    for country, codes in COUNTRY_TO_NUTS.items():
-        if country in text:
+    for country_or_adj, codes in COUNTRY_TO_NUTS.items():
+        if country_or_adj in text:
             found.extend(codes)
     return unique_keep_order(found)
 
@@ -395,18 +425,21 @@ def parse_human_definition(user_text: str) -> ParsedDefinition:
     if not parsed.typeOfDocument and ("tender" in text or "tenders" in text):
         parsed.typeOfDocument = DEFAULT_DOCUMENT_TYPES_FOR_TENDER_INTENT.copy()
         parsed.assumptions.append(
-            "Mapped 'tenders' to the default tender-oriented document types used in your example output."
+            "Mapped 'tenders' to the default tender-oriented document types."
         )
 
     if parsed.estimatedPrice and not parsed.estimatedPrice.currency:
         parsed.estimatedPrice.currency = "EUR"
         parsed.assumptions.append("No currency was specified, so EUR was assumed.")
 
-    if "greece" in text and not parsed.nutsCodes:
-        parsed.warnings.append("Greece was mentioned but no NUTS code could be mapped.")
-
     if "medicine" in text or "medicines" in text:
         parsed.assumptions.append("Mapped medicines/pharmaceuticals to CPV 336*.")
+
+    if "food" in text:
+        parsed.assumptions.append("Mapped food to starter CPV family 15*.")
+
+    if "office equipment" in text or "office supplies" in text or "office machinery" in text:
+        parsed.assumptions.append("Mapped office equipment to starter CPV family 301*.")
 
     if parsed.estimatedPrice:
         parsed.assumptions.append(
@@ -421,6 +454,16 @@ def parse_human_definition(user_text: str) -> ParsedDefinition:
     if "without lots" in text or "not divided into lots" in text:
         parsed.warnings.append(
             "divisionIntoLots is positive-only in TS syntax. 'Without lots' is not emitted as divisionIntoLots:(false)."
+        )
+
+    if not parsed.cpvCodes and not parsed.excludeCpvCodes:
+        parsed.warnings.append(
+            "No CPV mapping was detected from the current starter dictionary."
+        )
+
+    if not parsed.nutsCodes and any(word in text for word in ["greek", "german", "cypriot", "austrian", "romanian", "spanish"]):
+        parsed.warnings.append(
+            "A country adjective was detected but no NUTS mapping was produced."
         )
 
     return parsed
@@ -588,7 +631,7 @@ st.set_page_config(page_title="TS Query MVP", layout="wide")
 st.title("TS Search Query MVP")
 st.caption("Human-readable tender request → structured filters → TS query draft")
 
-example = "Active and expired awarded contracts for construction for Germany but not buildings"
+example = "Give me greek tenders for office equipment"
 user_text = st.text_area(
     "Describe the search you want",
     value=example,
@@ -619,16 +662,14 @@ with col1:
                 st.warning(item)
 
 with col2:
-    st.subheader("How to improve next")
+    st.subheader("What this version improves")
     st.markdown(
         """
-1. Replace the rule-based parser with an LLM extraction step that outputs JSON only.
-2. Expand the mapping dictionaries using your real search filters sheet.
-3. Add exact builders for currency/date fields after collecting a few UI-generated examples.
-4. Add a better CPV hierarchy / taxonomy layer instead of hardcoded starter mappings.
-5. Add a validation layer so only allowed field values are emitted.
-6. Add a 'show structured query' mode like the TS UI.
-7. Keep `dataSource` out of the natural-language MVP because it is portal/language specific.
+1. Country adjectives now work, e.g. `greek`, `german`, `cypriot`.
+2. Broader starter CPV mappings now work, e.g. `food`, `office equipment`.
+3. `title` / `description` / `fulltext` are still only used for explicit text-search requests.
+4. CPV exclusions remain separate from CPV inclusions.
+5. Excluded CPVs are removed from included CPVs.
         """
     )
 
@@ -637,8 +678,8 @@ st.markdown(
     """
 ### Notes
 - This version intentionally uses a **deterministic builder** for the final query.
-- `title` / `description` / `fulltext` are only used for explicit text-search requests.
 - The estimated price syntax follows the real example pattern, e.g. `estimatedPriceEur:[10000 TO 100000]`.
 - The country/category dictionaries are still starter examples only.
+- The best next step is to replace the starter CPV dictionary with your level-4 CPV dataset.
     """
 )
