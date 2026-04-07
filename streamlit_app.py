@@ -1,22 +1,18 @@
-import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import streamlit as st
+
 
 # -----------------------------
 # MVP CONFIG
 # -----------------------------
-# Keep this first version narrow and explicit.
-# The AI/LLM step can be added later. For now we support:
-# - country -> nutsCodes
-# - category -> cpvCodes
-# - status -> status
-# - type of document -> typeOfDocument
-# - estimated price min/max -> estimatedPrice
-# - free keywords -> title/description/fulltext block
-# - exclusions -> NOT block
+# Rules:
+# - Prefer structured filters over text search
+# - Only use title/description/fulltext if user explicitly asks for word/phrase search
+# - CPV exclusions should be emitted as NOT cpvCodes:(...)
+# - Excluded CPVs must not also appear in included CPVs
 
 FIELD_CONFIG = {
     "title": {"type": "text", "query_field": "title"},
@@ -28,7 +24,8 @@ FIELD_CONFIG = {
     "typeOfDocument": {"type": "multi", "query_field": "typeOfDocument"},
     "subTypeOfDocument": {"type": "multi", "query_field": "subTypeOfDocument"},
     "status": {"type": "multi", "query_field": "status"},
-    "procedure": {"type": "multi", "query_field": "procedure"},    "authorityTypes": {"type": "multi", "query_field": "authorityTypes"},
+    "procedure": {"type": "multi", "query_field": "procedure"},
+    "authorityTypes": {"type": "multi", "query_field": "authorityTypes"},
     "frameworkAgreement": {"type": "multi", "query_field": "frameworkAgreement"},
     "divisionIntoLots": {"type": "boolean", "query_field": "divisionIntoLots"},
     "publicationDate": {"type": "date_range", "query_field": "publicationDate"},
@@ -74,7 +71,7 @@ CATEGORY_TO_CPV = {
     "software": ["48*"],
     "construction": ["45*"],
 
-    # NEW: building-related exclusions (important for your case)
+    # building-related exclusions / narrower construction categories
     "buildings": ["4521*", "453*", "454*"],
     "building": ["4521*", "453*", "454*"],
     "building construction": ["4521*", "453*", "454*"],
@@ -147,9 +144,9 @@ class PriceFilter:
 
 @dataclass
 class ParsedDefinition:
-    # Note: divisionIntoLots follows TS behavior:
+    # divisionIntoLots follows TS behavior:
     # - if True -> include divisionIntoLots:(true)
-    # - if False or None -> DO NOT include the field at all
+    # - otherwise omit entirely
 
     status: List[str] = field(default_factory=list)
     typeOfDocument: List[str] = field(default_factory=list)
@@ -159,6 +156,7 @@ class ParsedDefinition:
     procedure: List[str] = field(default_factory=list)
     authorityTypes: List[str] = field(default_factory=list)
     frameworkAgreementAnyOrMissing: bool = False
+    divisionIntoLots: Optional[bool] = None
     estimatedPrice: Optional[PriceFilter] = None
     keywords: List[str] = field(default_factory=list)
     excludeKeywords: List[str] = field(default_factory=list)
@@ -171,9 +169,11 @@ class ParsedDefinition:
             "typeOfDocument": self.typeOfDocument,
             "nutsCodes": self.nutsCodes,
             "cpvCodes": self.cpvCodes,
+            "excludeCpvCodes": self.excludeCpvCodes,
             "procedure": self.procedure,
             "authorityTypes": self.authorityTypes,
             "frameworkAgreementAnyOrMissing": self.frameworkAgreementAnyOrMissing,
+            "divisionIntoLots": self.divisionIntoLots,
             "keywords": self.keywords,
             "excludeKeywords": self.excludeKeywords,
             "warnings": self.warnings,
@@ -197,6 +197,20 @@ def normalize_text(text: str) -> str:
     return text
 
 
+def unique_keep_order(values: List[str]) -> List[str]:
+    return list(dict.fromkeys(v for v in values if v))
+
+
+def get_inclusion_text(text: str) -> str:
+    """
+    Keep only the part before exclusion phrases.
+    Example:
+    'construction for germany but not buildings' -> 'construction for germany'
+    """
+    parts = re.split(r"\b(?:but not|except|not)\b", text, maxsplit=1)
+    return parts[0].strip()
+
+
 def extract_price(text: str) -> Optional[PriceFilter]:
     patterns = [
         r"(?:above|over|more than|greater than)\s+(\d+[\d,\.]*)\s*(euro|euros|eur)?",
@@ -205,7 +219,6 @@ def extract_price(text: str) -> Optional[PriceFilter]:
         r"(?:between)\s+(\d+[\d,\.]*)\s*(?:and|to)\s+(\d+[\d,\.]*)\s*(euro|euros|eur)?",
     ]
 
-    # between X and Y
     match = re.search(patterns[3], text)
     if match:
         amount_from = float(match.group(1).replace(",", ""))
@@ -213,7 +226,6 @@ def extract_price(text: str) -> Optional[PriceFilter]:
         currency = "EUR" if match.group(3) else None
         return PriceFilter(amount_from=amount_from, amount_to=amount_to, currency=currency)
 
-    # above/from
     for idx in [0, 1]:
         match = re.search(patterns[idx], text)
         if match:
@@ -221,7 +233,6 @@ def extract_price(text: str) -> Optional[PriceFilter]:
             currency = "EUR" if match.group(2) else None
             return PriceFilter(amount_from=amount_from, currency=currency)
 
-    # below/under
     match = re.search(patterns[2], text)
     if match:
         amount_to = float(match.group(1).replace(",", ""))
@@ -236,15 +247,22 @@ def extract_country_nuts(text: str) -> List[str]:
     for country, codes in COUNTRY_TO_NUTS.items():
         if country in text:
             found.extend(codes)
-    return list(dict.fromkeys(found))
+    return unique_keep_order(found)
 
 
 def extract_category_cpv(text: str) -> List[str]:
+    """
+    Include CPV mapping should only use the inclusion part of the text,
+    not the excluded part.
+    """
     found: List[str] = []
+    inclusion_text = get_inclusion_text(text)
+
     for label, codes in CATEGORY_TO_CPV.items():
-        if label in text:
+        if label in inclusion_text:
             found.extend(codes)
-    return list(dict.fromkeys(found))
+
+    return unique_keep_order(found)
 
 
 def extract_status(text: str) -> List[str]:
@@ -252,7 +270,7 @@ def extract_status(text: str) -> List[str]:
     for canonical, variants in STATUS_SYNONYMS.items():
         if any(v in text for v in variants):
             result.append(canonical)
-    return result
+    return unique_keep_order(result)
 
 
 def extract_doc_types(text: str) -> List[str]:
@@ -260,7 +278,7 @@ def extract_doc_types(text: str) -> List[str]:
     for canonical, variants in TYPE_SYNONYMS.items():
         if any(v in text for v in variants):
             result.append(canonical)
-    return result
+    return unique_keep_order(result)
 
 
 def extract_procedures(text: str) -> List[str]:
@@ -268,7 +286,7 @@ def extract_procedures(text: str) -> List[str]:
     for label, backend_value in PROCEDURE_MAP.items():
         if label in text:
             result.append(backend_value)
-    return list(dict.fromkeys(result))
+    return unique_keep_order(result)
 
 
 def extract_authority_types(text: str) -> List[str]:
@@ -276,19 +294,38 @@ def extract_authority_types(text: str) -> List[str]:
     for label, backend_value in AUTHORITY_TYPE_MAP.items():
         if label in text:
             result.append(backend_value)
-    return list(dict.fromkeys(result))
+    return unique_keep_order(result)
+
+
+def extract_division_into_lots(text: str) -> Optional[bool]:
+    positive_phrases = [
+        "with lots",
+        "divided into lots",
+        "only tenders with lots",
+        "tenders with lots",
+    ]
+    if any(phrase in text for phrase in positive_phrases):
+        return True
+    return None
 
 
 def extract_exclusions(text: str) -> List[str]:
     results: List[str] = []
-    # Very simple MVP rule: "not X" or "except X"
-    for pattern in [r"not ([a-zA-Z0-9\-\s]+)", r"except ([a-zA-Z0-9\-\s]+)"]:
+
+    patterns = [
+        r"but not ([a-zA-Z0-9\-\s]+)",
+        r"not ([a-zA-Z0-9\-\s]+)",
+        r"except ([a-zA-Z0-9\-\s]+)",
+    ]
+
+    for pattern in patterns:
         for match in re.finditer(pattern, text):
             phrase = match.group(1).strip()
-            phrase = re.split(r"\b(from|with|above|below|under|over|and)\b", phrase)[0].strip()
+            phrase = re.split(r"\b(from|with|above|below|under|over|and|or|for)\b", phrase)[0].strip()
             if phrase:
                 results.append(phrase)
-    return results
+
+    return unique_keep_order(results)
 
 
 def extract_exclude_cpv_codes(exclude_keywords: List[str]) -> List[str]:
@@ -298,32 +335,37 @@ def extract_exclude_cpv_codes(exclude_keywords: List[str]) -> List[str]:
         for label, codes in CATEGORY_TO_CPV.items():
             if phrase_norm == label or phrase_norm in label or label in phrase_norm:
                 found.extend(codes)
-    return list(dict.fromkeys(found))
+    return unique_keep_order(found)
 
 
 def extract_keywords(text: str, parsed: ParsedDefinition) -> List[str]:
-    scrubbed = text
+    """
+    IMPORTANT RULE:
+    Do not use title/description/fulltext unless the user explicitly asks for text search.
+    """
+    explicit_patterns = [
+        r"contain the word\s+(.+)",
+        r"contains the word\s+(.+)",
+        r"contain the phrase\s+(.+)",
+        r"contains the phrase\s+(.+)",
+        r"with the word\s+(.+)",
+        r"with the phrase\s+(.+)",
+        r"in the title\s+(.+)",
+        r"in title\s+(.+)",
+        r"in the description\s+(.+)",
+        r"in description\s+(.+)",
+        r"in the fulltext\s+(.+)",
+        r"in fulltext\s+(.+)",
+    ]
 
-    for country in COUNTRY_TO_NUTS:
-        scrubbed = scrubbed.replace(country, "")
-    for category in CATEGORY_TO_CPV:
-        scrubbed = scrubbed.replace(category, "")
-    for variants in STATUS_SYNONYMS.values():
-        for v in variants:
-            scrubbed = scrubbed.replace(v, "")
-    for variants in TYPE_SYNONYMS.values():
-        for v in variants:
-            scrubbed = scrubbed.replace(v, "")
+    for pattern in explicit_patterns:
+        match = re.search(pattern, text)
+        if match:
+            phrase = match.group(1).strip(" .,")
+            if phrase:
+                return [phrase]
 
-    scrubbed = re.sub(r"(?:above|over|more than|greater than|from|below|under|less than|between)\s+\d+[\d,\.]*\s*(euro|euros|eur)?", "", scrubbed)
-    scrubbed = re.sub(r"\b(give me|show me|find me|all the|all|for|from|with|that are|which are|priced|price)\b", "", scrubbed)
-    scrubbed = re.sub(r"\s+", " ", scrubbed).strip(" ,.")
-
-    if not scrubbed:
-        return []
-
-    # Split lightly; later you can improve with phrases and operators.
-    return [scrubbed] if scrubbed else []
+    return []
 
 
 def parse_human_definition(user_text: str) -> ParsedDefinition:
@@ -337,12 +379,18 @@ def parse_human_definition(user_text: str) -> ParsedDefinition:
     parsed.estimatedPrice = extract_price(text)
     parsed.procedure = extract_procedures(text)
     parsed.authorityTypes = extract_authority_types(text)
+    parsed.divisionIntoLots = extract_division_into_lots(text)
     parsed.frameworkAgreementAnyOrMissing = any(
         phrase in text for phrase in ["framework agreement", "framework agreements"]
     )
+
     parsed.excludeKeywords = extract_exclusions(text)
     parsed.excludeCpvCodes = extract_exclude_cpv_codes(parsed.excludeKeywords)
     parsed.keywords = extract_keywords(text, parsed)
+
+    # Prevent same CPV from being both included and excluded
+    if parsed.excludeCpvCodes:
+        parsed.cpvCodes = [code for code in parsed.cpvCodes if code not in parsed.excludeCpvCodes]
 
     if not parsed.typeOfDocument and ("tender" in text or "tenders" in text):
         parsed.typeOfDocument = DEFAULT_DOCUMENT_TYPES_FOR_TENDER_INTENT.copy()
@@ -363,6 +411,16 @@ def parse_human_definition(user_text: str) -> ParsedDefinition:
     if parsed.estimatedPrice:
         parsed.assumptions.append(
             "Estimated price range is emitted as a currency-specific range field, e.g. estimatedPriceEur:[min TO max]."
+        )
+
+    if parsed.keywords:
+        parsed.assumptions.append(
+            "Text search fields are only used because an explicit text-search phrase was detected."
+        )
+
+    if "without lots" in text or "not divided into lots" in text:
+        parsed.warnings.append(
+            "divisionIntoLots is positive-only in TS syntax. 'Without lots' is not emitted as divisionIntoLots:(false)."
         )
 
     return parsed
@@ -407,12 +465,12 @@ def build_main_text_block(keywords: List[str]) -> str:
 def build_exclusion_block(exclude_keywords: List[str], exclude_cpv_codes: List[str]) -> str:
     blocks: List[str] = []
 
-    # 1. CPV exclusions (preferred)
+    # Preferred: CPV exclusions
     if exclude_cpv_codes:
         cpv_joined = " OR ".join(exclude_cpv_codes)
         blocks.append(f'cpvCodes:({cpv_joined})')
 
-    # 2. Remaining text exclusions
+    # Only keep text exclusions that were not mapped to CPV
     remaining_keywords = []
     for k in exclude_keywords:
         phrase_norm = k.strip().lower()
@@ -456,8 +514,6 @@ def build_estimated_price_clause(price: Optional[PriceFilter]) -> str:
     if not price:
         return ""
 
-    # Based on the real generated query example provided by the user.
-    # Currency-specific range fields appear to use names like estimatedPriceEur.
     field_name = "estimatedPriceEur"
     if price.currency and price.currency.upper() != "EUR":
         field_name = f'estimatedPrice{price.currency.title()}'
@@ -468,7 +524,6 @@ def build_estimated_price_clause(price: Optional[PriceFilter]) -> str:
 
 
 def build_boolean_field(field_name: str, value: Optional[bool]) -> str:
-    # TS behavior: only include when True, otherwise omit entirely
     if value is True:
         return f"{field_name}:(true)"
     return ""
@@ -508,8 +563,7 @@ def build_ts_query(parsed: ParsedDefinition) -> str:
     if parsed.frameworkAgreementAnyOrMissing:
         positive_blocks.append('(frameworkAgreement:(0 OR 1) OR (*:* NOT frameworkAgreement:[* TO *]))')
 
-    # divisionIntoLots handling (only include if true)
-    division_block = build_boolean_field("divisionIntoLots", getattr(parsed, "divisionIntoLots", None))
+    division_block = build_boolean_field("divisionIntoLots", parsed.divisionIntoLots)
     if division_block:
         positive_blocks.append(division_block)
 
@@ -534,7 +588,7 @@ st.set_page_config(page_title="TS Query MVP", layout="wide")
 st.title("TS Search Query MVP")
 st.caption("Human-readable tender request → structured filters → TS query draft")
 
-example = "Give me all the active tenders from Greece for medicines with price above 10000 Euros"
+example = "Active and expired awarded contracts for construction for Germany but not buildings"
 user_text = st.text_area(
     "Describe the search you want",
     value=example,
@@ -571,7 +625,7 @@ with col2:
 1. Replace the rule-based parser with an LLM extraction step that outputs JSON only.
 2. Expand the mapping dictionaries using your real search filters sheet.
 3. Add exact builders for currency/date fields after collecting a few UI-generated examples.
-4. Support operators like AND / OR / NOT inside keyword requests.
+4. Add a better CPV hierarchy / taxonomy layer instead of hardcoded starter mappings.
 5. Add a validation layer so only allowed field values are emitted.
 6. Add a 'show structured query' mode like the TS UI.
 7. Keep `dataSource` out of the natural-language MVP because it is portal/language specific.
@@ -582,9 +636,9 @@ st.divider()
 st.markdown(
     """
 ### Notes
-- This first version intentionally uses a **deterministic builder** for the final query.
-- The estimated price syntax now follows the real example pattern, e.g. `estimatedPriceEur:[10000 TO 100000]`.
-- The country/category dictionaries are starter examples only.
-- Other exact field syntaxes like `(*:* NOT dataSource:("ted"))`, switch defaults, and nullable-field patterns can now be added the same way from real samples.
+- This version intentionally uses a **deterministic builder** for the final query.
+- `title` / `description` / `fulltext` are only used for explicit text-search requests.
+- The estimated price syntax follows the real example pattern, e.g. `estimatedPriceEur:[10000 TO 100000]`.
+- The country/category dictionaries are still starter examples only.
     """
 )
